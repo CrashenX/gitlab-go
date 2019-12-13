@@ -34,7 +34,7 @@ func theAppIsRunning(arg1 string) error {
 }
 
 func aRequestIsMadeTo(arg1 string) error {
-	resp, err := http.Get("http://127.0.0.1" + arg1)
+	resp, err := http.Get("http://127.0.0.1:5000" + arg1)
 	if err != nil {
 		return err
 	}
