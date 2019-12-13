@@ -1,0 +1,130 @@
+# Derived from GitLab's Auto DevOps Template
+
+# NB: See the Auto-DevOps.gitlab-ci.yml for imporant documentation
+# https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Auto-DevOps.gitlab-ci.yml
+
+# Test jobs may be disabled by setting environment variables:
+# NB: See Auto-DevOps.gitlab-ci.yml for jobs included by templates
+# - behavior: BEHAVIOR_TESTS_DISABLED
+# - security: SECURITY_TESTS_DISABLED
+# - perf: PERF_TESTS_DISABLED
+
+image: alpine:latest
+
+variables:
+  TEST_DISABLED: "true"
+  PERFORMANCE_DISABLED: "true"
+  HELM_UPGRADE_EXTRA_ARGS: --cleanup-on-fail --set replicaCount=3 --set ingress.annotations.cert-manager\.io/cluster-issuer=RELEASE-letsencrypt-staging-cluster-issuer --set ingress.annotations.kubernetes\.io/ingress\.class=RELEASE-nginx
+  BUILDPACK_URL: https://github.com/heroku/heroku-buildpack-go
+  HTTPS_PORT: 30443
+
+  POSTGRES_ENABLED: "false"
+
+  DOCKER_DRIVER: overlay2
+
+  ROLLOUT_RESOURCE_TYPE: deployment
+
+  DOCKER_TLS_CERTDIR: ""  # https://gitlab.com/gitlab-org/gitlab-runner/issues/4501
+
+# NB: This might need to be tweaked depending on your gitlab deployment
+before_script:
+  - export BASE_DOMAIN="$(echo $CI_SERVER_HOST | cut -d '.' -f 2-)"
+  - export RELEASE="$(echo $CI_SERVER_HOST | cut -d '.' -f 2)"
+  - echo "CI_COMMIT_REF_NAME is $CI_COMMIT_REF_NAME"
+  - export HELM_UPGRADE_EXTRA_ARGS="$(echo -n $HELM_UPGRADE_EXTRA_ARGS | sed -e "s/RELEASE/$RELEASE/g")"
+  - |
+    if [ "$CI_COMMIT_REF_NAME" == 'master' ]; then
+        export HELM_UPGRADE_EXTRA_ARGS="$(echo -n $HELM_UPGRADE_EXTRA_ARGS | sed -e 's/staging-//')"
+    fi
+  - echo "HELM_UPGRADE_EXTRA_ARGS are $HELM_UPGRADE_EXTRA_ARGS"
+  - export CI_REGISTRY="registry.$BASE_DOMAIN:$HTTPS_PORT"
+  - export CI_APPLICATION_REPOSITORY="$CI_REGISTRY/$CI_PROJECT_PATH"
+  - export KUBE_INGRESS_BASE_DOMAIN="$BASE_DOMAIN"
+
+stages:
+  - build
+  - test
+  - deploy  # dummy stage to follow the template guidelines
+  - review
+  - dast
+  - staging
+  - canary
+  - production
+  - incremental rollout 10%
+  - incremental rollout 25%
+  - incremental rollout 50%
+  - incremental rollout 100%
+  - performance
+  - cleanup
+
+
+include:
+  - template: Jobs/Build.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/Build.gitlab-ci.yml & https://gitlab.com/gitlab-org/cluster-integration/auto-build-image/blob/master/src/build.sh
+  - template: Jobs/Test.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/Test.gitlab-ci.yml
+  - template: Jobs/Code-Quality.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/Code-Quality.gitlab-ci.yml
+  - template: Jobs/Deploy.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/Deploy.gitlab-ci.yml
+  - template: Jobs/DAST-Default-Branch-Deploy.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/DAST-Default-Branch-Deploy.gitlab-ci.yml
+  - template: Jobs/Browser-Performance-Testing.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Jobs/Browser-Performance-Testing.gitlab-ci.yml
+  - template: Security/DAST.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Security/DAST.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/License-Management.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Security/License-Management.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml  # https://gitlab.com/gitlab-org/gitlab-foss/blob/master/lib/gitlab/ci/templates/Security/SAST.gitlab-ci.yml
+
+behavior:
+  stage: test
+  image: golang:latest
+  script:
+    - echo Running security tests
+    - make install-tools build test-behavior
+  only:
+    - branches
+  except:
+    variables:
+      - $BEHAVIOR_TESTS_DISABLED
+
+security:
+  stage: test
+  image: golang:latest
+  script:
+    - echo Running security tests
+    - make install-tools build test-security
+  only:
+    - branches
+  except:
+    variables:
+      - $SECURITY_TESTS_DISABLED
+
+perf:
+  stage: performance
+  image: docker:stable
+  allow_failure: true
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  services:
+    - docker:stable-dind
+  script:
+    - |
+      if ! docker info &>/dev/null; then
+        if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+          export DOCKER_HOST='tcp://localhost:2375'
+        fi
+      fi
+    - export CI_ENVIRONMENT_URL="$(cat environment_url.txt | sed -e 's/http/https/'):$HTTPS_PORT"
+    - mkdir gitlab-exporter
+    - wget -O gitlab-exporter/index.js https://gitlab.com/gitlab-org/gl-performance/raw/1.0.0/index.js
+    - mkdir sitespeed-results
+    - docker run --shm-size=1g --rm -v "$(pwd)":/sitespeed.io sitespeedio/sitespeed.io:11.2.0 --plugins.add ./gitlab-exporter --outputFolder sitespeed-results "$CI_ENVIRONMENT_URL"
+    - mv sitespeed-results/data/performance.json performance.json
+  artifacts:
+    paths:
+      - performance.json
+      - sitespeed-results/
+  only:
+    refs:
+      - branches
+      - tags
+    kubernetes: active
+  except:
+    variables:
+      - $PERF_TESTS_DISABLED
